@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""Keep the `vu2cpl-immich` CasaOS store app in step with official Immich releases.
+
+CasaOS shows "Update" on an installed app when the image tag of its main
+service differs from the same app in a registered store, and clicking it
+swaps only the `image:` lines (volumes, env and paths stay as installed).
+So a store entry that mirrors Immich's own release compose, published
+promptly, gives native one-click updates.
+
+This script decides whether the latest Immich release can be published:
+
+  publish  images/healthchecks changed only, no breaking-change notes
+  hold     anything that needs a human first (major version, a "Breaking
+           Changes" section in any release since the last published one,
+           compose or example.env changes beyond images/healthchecks);
+           re-run with --approve <tag> once the manual steps are done
+  blocked  service names changed; CasaOS refuses to update across that,
+           so it needs a manual migration and can't be approved
+  noop     already published
+
+On publish it renders Apps/vu2cpl-immich/docker-compose.yml, updates
+state/ and upstream/, and writes dist/casaos-appstore.zip. Results go to
+$GITHUB_OUTPUT (action, upstream_tag, release_tag) plus dist/issue.md or
+dist/release-notes.md.
+"""
+
+import argparse
+import copy
+import difflib
+import hashlib
+import json
+import os
+import re
+import sys
+import urllib.request
+import zipfile
+from pathlib import Path
+
+import yaml
+
+UPSTREAM_REPO = "immich-app/immich"
+STORE_APP = "vu2cpl-immich"
+SERVICES = {"immich-server", "immich-machine-learning", "redis", "database"}
+
+ROOT = Path(__file__).resolve().parent.parent
+STATE_FILE = ROOT / "state" / "immich.json"
+SNAPSHOT_DIR = ROOT / "upstream" / "immich"
+TEMPLATE_FILE = ROOT / "templates" / "immich" / "x-casaos.yml"
+APP_DIR = ROOT / "Apps" / STORE_APP
+DIST = ROOT / "dist"
+ZIP_PATH = DIST / "casaos-appstore.zip"
+
+# Variables in Immich's compose that only steer compose itself. For the store
+# copy they get CasaOS-style defaults; an existing install keeps its own paths
+# because a CasaOS update never touches volumes.
+COMPOSE_ONLY_VARS = {
+    "UPLOAD_LOCATION": "/DATA/Gallery/immich",
+    "DB_DATA_LOCATION": "/DATA/AppData/$AppID/pgdata",
+}
+
+BREAKING_HEADING = re.compile(r"^#{1,6}[^\n]*breaking changes", re.IGNORECASE | re.MULTILINE)
+VAR_REF = re.compile(r"\$\{(\w+)(?::?-([^}]*))?\}")
+
+
+def api(path):
+    req = urllib.request.Request(f"https://api.github.com/{path}")
+    req.add_header("Accept", "application/vnd.github+json")
+    token = os.environ.get("GH_TOKEN")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(req, timeout=30) as res:
+        return json.load(res)
+
+
+def download(url):
+    with urllib.request.urlopen(url, timeout=60) as res:
+        return res.read().decode()
+
+
+def version(tag):
+    m = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", tag)
+    if not m:
+        raise ValueError(f"unexpected Immich tag format: {tag}")
+    return tuple(int(x) for x in m.groups())
+
+
+def parse_env(text):
+    env = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        env[key.strip()] = value.strip()
+    return env
+
+
+def structure(doc):
+    """The compose document minus the parts a CasaOS update carries over."""
+    doc = copy.deepcopy(doc)
+    for svc in doc.get("services", {}).values():
+        svc.pop("image", None)
+        svc.pop("healthcheck", None)
+    return doc
+
+
+def yaml_diff(old, new, label):
+    a = yaml.safe_dump(old, sort_keys=True).splitlines()
+    b = yaml.safe_dump(new, sort_keys=True).splitlines()
+    return "\n".join(difflib.unified_diff(a, b, f"{label} (last published)", f"{label} (new)", lineterm=""))
+
+
+def render(compose_text, env, tag, template):
+    values = {k: v for k, v in env.items() if k not in COMPOSE_ONLY_VARS}
+    values.update(COMPOSE_ONLY_VARS)
+    values["IMMICH_VERSION"] = tag
+
+    def substitute(match):
+        key, default = match.group(1), match.group(2)
+        if key in values:
+            return values[key]
+        if default is not None:
+            return default
+        raise KeyError(f"compose references ${{{key}}}, which has no value")
+
+    doc = yaml.safe_load(VAR_REF.sub(substitute, compose_text))
+    doc["name"] = STORE_APP
+
+    container_env = {k: v for k, v in env.items() if k not in COMPOSE_ONLY_VARS and k != "IMMICH_VERSION"}
+    for svc in doc["services"].values():
+        if svc.pop("env_file", None) is not None:
+            svc["environment"] = {**container_env, **(svc.get("environment") or {})}
+        svc["x-casaos"] = {"envs": []}
+
+    x_casaos = copy.deepcopy(template)
+    x_casaos["version"] = tag.lstrip("v")
+    doc["x-casaos"] = x_casaos
+
+    header = (
+        f"# Generated by scripts/update_immich.py from the official Immich {tag} release compose:\n"
+        f"# https://github.com/{UPSTREAM_REPO}/releases/tag/{tag}\n"
+        "# Do not edit by hand.\n"
+    )
+    return header + yaml.safe_dump(doc, sort_keys=False, allow_unicode=True, width=120)
+
+
+def build_zip(compose_yaml, tag, previous_size):
+    """Deterministic zip whose size differs from the previous release asset.
+
+    CasaOS only re-downloads a store when a HEAD request reports a different
+    Content-Length, so an equal size would hide the update.
+    """
+    DIST.mkdir(exist_ok=True)
+    info = json.dumps({"immich": tag, "source": f"https://github.com/{UPSTREAM_REPO}/releases/tag/{tag}"}, indent=2)
+    pad = 0
+    while True:
+        with zipfile.ZipFile(ZIP_PATH, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name, data in (
+                (f"casaos-appstore/Apps/{STORE_APP}/docker-compose.yml", compose_yaml),
+                ("casaos-appstore/store-info.json", info + "\n" + " " * pad),
+            ):
+                entry = zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0))
+                entry.external_attr = 0o644 << 16
+                entry.compress_type = zipfile.ZIP_DEFLATED
+                zf.writestr(entry, data)
+        size = ZIP_PATH.stat().st_size
+        if size != previous_size:
+            return size
+        pad += 1
+
+
+def next_release_tag(tag, state):
+    base = f"immich-{tag}"
+    previous = state.get("store_release_tag", "")
+    if previous == base:
+        return f"{base}-r2"
+    m = re.fullmatch(re.escape(base) + r"-r(\d+)", previous)
+    if m:
+        return f"{base}-r{int(m.group(1)) + 1}"
+    return base
+
+
+def set_output(**kwargs):
+    lines = "".join(f"{k}={v}\n" for k, v in kwargs.items())
+    out = os.environ.get("GITHUB_OUTPUT")
+    if out:
+        with open(out, "a") as fh:
+            fh.write(lines)
+    sys.stdout.write(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--approve", default="", help="publish this held tag anyway (manual steps done)")
+    parser.add_argument("--force", action="store_true", help="rebuild and republish even if already published")
+    args = parser.parse_args()
+
+    state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+    template_bytes = TEMPLATE_FILE.read_bytes()
+    template_sha = hashlib.sha256(template_bytes + Path(__file__).read_bytes()).hexdigest()
+
+    tag = api(f"repos/{UPSTREAM_REPO}/releases/latest")["tag_name"]
+    published = state.get("published_upstream_tag")
+
+    if published == tag and state.get("template_sha256") == template_sha and not args.force:
+        print(f"Immich {tag} is already published as {state.get('store_release_tag')}")
+        set_output(action="noop", upstream_tag=tag, release_tag=state.get("store_release_tag", ""))
+        return
+
+    base = f"https://github.com/{UPSTREAM_REPO}/releases/download/{tag}"
+    compose_text = download(f"{base}/docker-compose.yml")
+    env_text = download(f"{base}/example.env")
+    compose = yaml.safe_load(compose_text)
+    env = parse_env(env_text)
+
+    DIST.mkdir(exist_ok=True)
+    names = set(compose.get("services", {}))
+    if names != SERVICES:
+        body = (
+            f"Immich [{tag}](https://github.com/{UPSTREAM_REPO}/releases/tag/{tag}) changed the compose service names.\n\n"
+            f"- expected: `{sorted(SERVICES)}`\n- now: `{sorted(names)}`\n\n"
+            "CasaOS refuses to update an app whose service names differ from the store copy, so this can't be "
+            "published or approved. The installed app needs a manual migration first, then this script's "
+            "`SERVICES` updated.\n"
+        )
+        (DIST / "issue.md").write_text(body)
+        print(body)
+        set_output(action="blocked", upstream_tag=tag, release_tag="")
+        return
+
+    reasons = []
+    if published and published != tag:
+        if version(tag)[0] != version(published)[0]:
+            reasons.append(f"New major version ({published} → {tag}). Read the upgrade guide before approving.")
+
+        for rel in api(f"repos/{UPSTREAM_REPO}/releases?per_page=100"):
+            rel_tag = rel["tag_name"]
+            if rel["draft"] or rel["prerelease"] or not re.fullmatch(r"v\d+\.\d+\.\d+", rel_tag):
+                continue
+            if version(published) < version(rel_tag) <= version(tag) and BREAKING_HEADING.search(rel.get("body") or ""):
+                reasons.append(f"[{rel_tag}]({rel['html_url']}) release notes have a Breaking Changes section.")
+
+        snap_compose = yaml.safe_load((SNAPSHOT_DIR / "docker-compose.yml").read_text())
+        if structure(snap_compose) != structure(compose):
+            diff = yaml_diff(structure(snap_compose), structure(compose), "docker-compose.yml")
+            reasons.append(
+                "The compose file changed beyond images and healthchecks. A CasaOS update only swaps images, so "
+                "apply these to `/var/lib/casaos/apps/immich/docker-compose.yml` by hand before approving:\n\n"
+                f"```diff\n{diff}\n```"
+            )
+
+        snap_env = parse_env((SNAPSHOT_DIR / "example.env").read_text())
+        if snap_env != env:
+            diff = yaml_diff(snap_env, env, "example.env")
+            reasons.append(
+                "example.env changed. Check whether the installed app needs the new or changed values:\n\n"
+                f"```diff\n{diff}\n```"
+            )
+
+    if reasons and args.approve != tag:
+        body = (
+            f"Immich [{tag}](https://github.com/{UPSTREAM_REPO}/releases/tag/{tag}) was not published to the "
+            f"CasaOS store automatically (last published: {published}).\n\n"
+            + "\n\n".join(f"- {r}" for r in reasons)
+            + "\n\nWhen it's safe, publish it from **Actions → Update Immich store app → Run workflow** with "
+            f"`approve` set to `{tag}`.\n"
+        )
+        (DIST / "issue.md").write_text(body)
+        print(body)
+        set_output(action="hold", upstream_tag=tag, release_tag="")
+        return
+
+    template = yaml.safe_load(template_bytes)
+    rendered = render(compose_text, env, tag, template)
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    (APP_DIR / "docker-compose.yml").write_text(rendered)
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    (SNAPSHOT_DIR / "docker-compose.yml").write_text(compose_text)
+    (SNAPSHOT_DIR / "example.env").write_text(env_text)
+
+    release_tag = next_release_tag(tag, state)
+    size = build_zip(rendered, tag, state.get("zip_size"))
+
+    notes = f"Store copy of the official Immich [{tag}](https://github.com/{UPSTREAM_REPO}/releases/tag/{tag}) compose."
+    if reasons:
+        notes += "\n\nPublished by manual approval after these holds:\n\n" + "\n\n".join(f"- {r}" for r in reasons)
+    (DIST / "release-notes.md").write_text(notes + "\n")
+
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps({
+        "published_upstream_tag": tag,
+        "store_release_tag": release_tag,
+        "template_sha256": template_sha,
+        "zip_size": size,
+    }, indent=2) + "\n")
+
+    print(f"Publishing Immich {tag} as {release_tag} ({size} bytes)")
+    set_output(action="publish", upstream_tag=tag, release_tag=release_tag)
+
+
+if __name__ == "__main__":
+    main()

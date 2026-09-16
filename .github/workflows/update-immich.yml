@@ -1,0 +1,96 @@
+name: Update Immich store app
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      approve:
+        description: "Publish this held Immich tag anyway (e.g. v3.3.0), after doing the manual steps in its issue"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild and republish even if this Immich version is already published"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: immich-store
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install pyyaml==6.0.2
+
+      - name: Check latest Immich release
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVE: ${{ inputs.approve }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          args=(--approve "$APPROVE")
+          if [ "$FORCE" = "true" ]; then args+=(--force); fi
+          python3 scripts/update_immich.py "${args[@]}"
+
+      - name: Publish store release
+        if: steps.build.outputs.action == 'publish'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.build.outputs.upstream_tag }}
+          RELEASE_TAG: ${{ steps.build.outputs.release_tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Apps state upstream
+          git commit -m "Publish Immich $UPSTREAM_TAG to the store ($RELEASE_TAG)"
+          git push
+          gh release create "$RELEASE_TAG" dist/casaos-appstore.zip \
+            --title "Immich $UPSTREAM_TAG" --notes-file dist/release-notes.md --latest
+          for n in $(gh issue list --state open --search "\"needs review\" in:title" --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Superseded: Immich $UPSTREAM_TAG is now published as $RELEASE_TAG."
+          done
+
+      - name: Open review issue
+        if: steps.build.outputs.action == 'hold' || steps.build.outputs.action == 'blocked'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.build.outputs.upstream_tag }}
+          ACTION: ${{ steps.build.outputs.action }}
+        run: |
+          title="Immich $UPSTREAM_TAG $ACTION: needs review"
+          existing=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[].number')
+          if [ -z "$existing" ]; then
+            gh issue create --title "$title" --body-file dist/issue.md
+          fi
+
+      - name: Telegram notice
+        if: steps.build.outputs.action != 'noop'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          UPSTREAM_TAG: ${{ steps.build.outputs.upstream_tag }}
+          ACTION: ${{ steps.build.outputs.action }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "Telegram secrets not set; skipping"
+            exit 0
+          fi
+          case "$ACTION" in
+            publish) text="📸 Immich $UPSTREAM_TAG is in the CasaOS store — click Update on the Immich tile." ;;
+            *)       text="⚠️ Immich $UPSTREAM_TAG $ACTION for the CasaOS store — see issues in $GITHUB_REPOSITORY." ;;
+          esac
+          curl -fsS "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+            --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" --data-urlencode "text=$text" >/dev/null

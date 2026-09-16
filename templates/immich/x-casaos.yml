@@ -1,0 +1,28 @@
+# Top-level x-casaos block for the vu2cpl-immich store app.
+# `version` is filled in by scripts/update_immich.py.
+architectures:
+  - amd64
+  - arm64
+id: com.vu2cpl.immich
+store_app_id: vu2cpl-immich
+main: immich-server
+title:
+  en_US: Immich (vu2cpl)
+tagline:
+  en_US: Official Immich compose, tracked automatically
+description:
+  en_US: >-
+    Self-hosted photo and video management. This is the official Immich
+    docker-compose, republished for CasaOS soon after each Immich release so
+    the CasaOS Update button stays current. Releases with breaking changes
+    are held back for manual review.
+developer: immich-app
+author: vu2cpl
+category: Media
+icon: https://cdn.jsdelivr.net/gh/selfhst/icons/png/immich.png
+port_map: "2283"
+scheme: http
+index: /
+website: https://immich.app
+repo: https://github.com/immich-app/immich
+support: https://github.com/vu2cpl/casaos-appstore/issues
