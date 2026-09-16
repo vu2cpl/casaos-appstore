@@ -37,6 +37,20 @@ keeps the shack's Immich current. Consumer: `macmini-server`
 
 ## Current state
 
+- First store release `immich-v3.2.2` published by the workflow on
+  2026-09-17 (zip 1532 bytes; release-asset HEAD returns that
+  Content-Length through GitHub's redirects).
+- Registered in CasaOS on macmini-server 2026-09-17 (store id 2;
+  catalog parsed `vu2cpl-immich` with the 3.2.2 images). Installed
+  `immich` app linked via `store_app_id`; CasaOS then reported update
+  available (`v3` → `v3.2.2`), and `PATCH
+  /v2/app_management/compose/immich` (what the Update button calls)
+  swapped exactly the image lines, kept volumes/env/ports, came back 4/4
+  healthy with all assets and albums, and flipped to no update pending.
+- Local test harness verified before publishing: bootstrap publish,
+  noop rerun, `--force` → `-r2` with a changed zip size, hold from a
+  simulated v3.0.0 baseline (v3.1.0's Breaking Changes section),
+  `--approve`, and a hold with diff on a non-image compose change.
 - Workflow `update-immich.yml`: every 6 h (`17 */6 * * *`) + manual
   dispatch (`approve`, `force` inputs).
 - Store URL:
