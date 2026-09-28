@@ -1,6 +1,6 @@
 {
-  "published_upstream_tag": "v3.2.2",
-  "store_release_tag": "immich-v3.2.2",
+  "published_upstream_tag": "v3.2.4",
+  "store_release_tag": "immich-v3.2.4",
   "template_sha256": "0b2e932e4e8368b0bb37454dbf9b785aa207cd21dc629ff3f2b57bf3c68771a7",
-  "zip_size": 1532
+  "zip_size": 1533
 }
